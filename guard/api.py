@@ -32,7 +32,7 @@ from guard.steps.prompt_guard import PromptGuardVerdict
 logger = logging.getLogger("guard.api")
 
 REJECT_MESSAGE = "Your request was blocked: jailbreak or prompt-injection detected."
-MASKED_MESSAGE = "PII detected and replaced with [REDACTED]; masked prompt ready to forward."
+MASKED_MESSAGE = "Your request was blocked: PII detected."
 CLEAN_MESSAGE = "Screening passed; prompt forwarded as-is."
 
 public_router = APIRouter(prefix="/v1", tags=["public"])
@@ -346,7 +346,10 @@ def _ask_response(result: AskResult) -> AskResponse:
 
 def _chat_response(result: ChatResult) -> ChatResponse:
     if result.status == STATUS_REJECTED:
-        message = REJECT_MESSAGE
+        if result.disposition == "REJECT":
+            message = REJECT_MESSAGE
+        else:
+            message = MASKED_MESSAGE
     elif result.chunks:
         message = f"Answer generated with {len(result.chunks)} retrieved chunk(s)."
     else:

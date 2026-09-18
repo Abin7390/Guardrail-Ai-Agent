@@ -28,6 +28,31 @@ class GuardResult:
     masking: MaskingResult | None
     masked_prompt: str | None
 
+def _flag_log_path() -> Path:
+    return Path(os.environ.get("GUARD_FLAG_LOG", DEFAULT_FLAG_LOG))
+
+
+def write_flag(result: GuardResult, raw: str) -> None:
+    """Append one JSON line for a flagged event; never stores raw PII."""
+    if result.masking is not None:
+        masked = result.masking.masked_text
+    else:
+        masked = mask(raw).masked_text
+    row = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "disposition": result.disposition,
+        "rules": result.rules,
+        "label": result.verdict.label if result.verdict else None,
+        "suspicious_score": result.verdict.suspicious_score if result.verdict else None,
+        "matched": result.verdict.matched if result.verdict else None,
+        "snippet": masked[:SNIPPET_LIMIT],
+    }
+    path = _flag_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    logger.info("flag logged -> %s", path)
+
 
 def screen(raw: str, reversible: bool = False) -> GuardResult:
     """Screen one raw prompt: REJECT on jailbreak, else MASKED/CLEAN after Presidio.
@@ -59,7 +84,7 @@ def screen(raw: str, reversible: bool = False) -> GuardResult:
             masking=None,
             masked_prompt=None,
         )
-        _write_flag(result, raw)
+        write_flag(result, raw)
         return result
     logger.info(
         "step 1/2 | RESULT: %s score=%.4f < threshold %.2f (engine=%s) -> proceed to masking",
@@ -81,13 +106,14 @@ def screen(raw: str, reversible: bool = False) -> GuardResult:
         ]
         result = GuardResult(
             disposition="MASKED",
+            # disposition="REJECT",
             flagged=True,
             rules=rules,
             verdict=verdict,
             masking=masking_result,
             masked_prompt=masking_result.masked_text,
         )
-        _write_flag(result, raw)
+        write_flag(result, raw)
         return result
     logger.info(
         "step 2/2 | RESULT: no PII found (engine=%s) -> CLEAN", masking_result.engine
@@ -102,27 +128,3 @@ def screen(raw: str, reversible: bool = False) -> GuardResult:
     )
 
 
-def _flag_log_path() -> Path:
-    return Path(os.environ.get("GUARD_FLAG_LOG", DEFAULT_FLAG_LOG))
-
-
-def _write_flag(result: GuardResult, raw: str) -> None:
-    """Append one JSON line for a flagged event; never stores raw PII."""
-    if result.masking is not None:
-        masked = result.masking.masked_text
-    else:
-        masked = mask(raw).masked_text
-    row = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "disposition": result.disposition,
-        "rules": result.rules,
-        "label": result.verdict.label if result.verdict else None,
-        "suspicious_score": result.verdict.suspicious_score if result.verdict else None,
-        "matched": result.verdict.matched if result.verdict else None,
-        "snippet": masked[:SNIPPET_LIMIT],
-    }
-    path = _flag_log_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    logger.info("flag logged -> %s", path)
