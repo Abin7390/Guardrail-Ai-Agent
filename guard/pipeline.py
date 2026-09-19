@@ -1,12 +1,18 @@
-"""Guard pipeline: jailbreak check first, Presidio masking second, flag logging."""
+"""Guard pipeline: jailbreak check first, Presidio masking second, flag logging.
 
-import json
+Flag rows are written through :mod:`guard.flags` using the unified schema
+(layer, user, full masked prompt, severity, reason, rules, details).
+"""
+
 import logging
-import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
 
+from guard.db import User
+from guard.flags import (
+    LAYER_MASKING,
+    LAYER_PROMPT_GUARD,
+    write_flag,
+)
 from guard.steps.masking import MaskingResult, mask
 from guard.steps.prompt_guard import PromptGuardVerdict, classify, get_threshold
 
@@ -14,9 +20,6 @@ logger = logging.getLogger("guard")
 
 RULE_JAILBREAK = "PROMPT_GUARD_SUSPICIOUS"
 RULE_PII = "PII_DETECTED"
-SNIPPET_LIMIT = 120
-
-DEFAULT_FLAG_LOG = Path(__file__).resolve().parent.parent / "flags.jsonl"
 
 
 @dataclass(frozen=True)
@@ -28,38 +31,14 @@ class GuardResult:
     masking: MaskingResult | None
     masked_prompt: str | None
 
-def _flag_log_path() -> Path:
-    return Path(os.environ.get("GUARD_FLAG_LOG", DEFAULT_FLAG_LOG))
 
-
-def write_flag(result: GuardResult, raw: str) -> None:
-    """Append one JSON line for a flagged event; never stores raw PII."""
-    if result.masking is not None:
-        masked = result.masking.masked_text
-    else:
-        masked = mask(raw).masked_text
-    row = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "disposition": result.disposition,
-        "rules": result.rules,
-        "label": result.verdict.label if result.verdict else None,
-        "suspicious_score": result.verdict.suspicious_score if result.verdict else None,
-        "matched": result.verdict.matched if result.verdict else None,
-        "snippet": masked[:SNIPPET_LIMIT],
-    }
-    path = _flag_log_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    logger.info("flag logged -> %s", path)
-
-
-def screen(raw: str, reversible: bool = False) -> GuardResult:
+def screen(raw: str, reversible: bool = False, user: User | None = None) -> GuardResult:
     """Screen one raw prompt: REJECT on jailbreak, else MASKED/CLEAN after Presidio.
 
     ``reversible=True`` masks with indexed ``[REDACTED_n]`` placeholders and
     carries the value mapping on ``GuardResult.masking`` for later demasking;
-    the flag-log snippet behavior is unchanged either way.
+    the flag rows always store the masked text, never the raw prompt. When
+    ``user`` is provided it is recorded on every flag row written here.
     """
     logger.info("step 1/2 | jailbreak check: running Prompt-Guard classifier")
     verdict = classify(raw)
@@ -84,7 +63,22 @@ def screen(raw: str, reversible: bool = False) -> GuardResult:
             masking=None,
             masked_prompt=None,
         )
-        write_flag(result, raw)
+        write_flag(
+            layer=LAYER_PROMPT_GUARD,
+            disposition="REJECT",
+            severity="high",
+            reason="jailbreak or prompt injection detected",
+            rules=result.rules,
+            user=user,
+            prompt_masked=mask(raw).masked_text,
+            details={
+                "label": verdict.label,
+                "suspicious_score": verdict.suspicious_score,
+                "threshold": threshold,
+                "engine": verdict.engine,
+                "matched": verdict.matched,
+            },
+        )
         return result
     logger.info(
         "step 1/2 | RESULT: %s score=%.4f < threshold %.2f (engine=%s) -> proceed to masking",
@@ -106,14 +100,25 @@ def screen(raw: str, reversible: bool = False) -> GuardResult:
         ]
         result = GuardResult(
             disposition="MASKED",
-            # disposition="REJECT",
             flagged=True,
             rules=rules,
             verdict=verdict,
             masking=masking_result,
             masked_prompt=masking_result.masked_text,
         )
-        write_flag(result, raw)
+        write_flag(
+            layer=LAYER_MASKING,
+            disposition="MASKED",
+            severity="low",
+            reason="personal data detected and masked",
+            rules=rules,
+            user=user,
+            prompt_masked=masking_result.masked_text,
+            details={
+                "entities": masking_result.entities,
+                "engine": masking_result.engine,
+            },
+        )
         return result
     logger.info(
         "step 2/2 | RESULT: no PII found (engine=%s) -> CLEAN", masking_result.engine
@@ -126,5 +131,3 @@ def screen(raw: str, reversible: bool = False) -> GuardResult:
         masking=masking_result,
         masked_prompt=raw,
     )
-
-

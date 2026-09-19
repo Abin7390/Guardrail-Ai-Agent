@@ -95,7 +95,8 @@ def test_chat_returns_response(fake_genai):
     }
 
 
-def test_chat_maps_system_and_options_into_config(fake_genai):
+def test_chat_maps_system_and_options_into_config(fake_genai, monkeypatch):
+    monkeypatch.delenv("GUARD_LLM_MODEL", raising=False)
     GeminiClient(api_key="k").chat(
         [{"role": "user", "content": "hi"}],
         system="be brief",

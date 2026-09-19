@@ -6,11 +6,11 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import guard.rag as rag
+import guard.steps.rag as rag
 import guard.steps.embedding as embedding
 from guard.db import Chunk, Document, User, init_db
 from guard.pipeline import GuardResult
-from guard.rag import ask
+from guard.steps.rag import ask
 from guard.steps.prompt_guard import PromptGuardVerdict
 
 
@@ -52,7 +52,7 @@ def offline_engines(monkeypatch):
     monkeypatch.setattr(embedding, "_model", None)
     monkeypatch.setattr(embedding, "_engine_mode", None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", None)
-    monkeypatch.setattr(rag, "screen", lambda raw: GuardResult(
+    monkeypatch.setattr(rag, "screen", lambda raw, **kwargs: GuardResult(
         "CLEAN", False, [], _verdict(False), None, raw
     ))
     monkeypatch.setattr(rag, "classify", lambda text: _verdict(False))
@@ -108,8 +108,9 @@ def _user(session, username):
     return session.scalar(select(User).where(User.username == username))
 
 
-def test_user1_gets_only_public_chunks(session, offline_engines, flag_log):
+def test_user1_gets_only_public_chunks(session, offline_engines, monkeypatch, flag_log):
     _seed(session)
+    monkeypatch.setenv("GUARD_ABAC_MATCH_THRESHOLD", "0.99")
     user = _user(session, "user1")
     result = ask(session, user, "which medicines treat a fever?")
     assert result.disposition == "CLEAN"
@@ -122,8 +123,11 @@ def test_user1_gets_only_public_chunks(session, offline_engines, flag_log):
     assert result.citations[0].title == "Medicine catalog"
 
 
-def test_user1_naming_patient_still_gets_no_patient_chunks(session, offline_engines, flag_log):
+def test_user1_naming_patient_still_gets_no_patient_chunks(
+    session, offline_engines, monkeypatch, flag_log
+):
     _seed(session)
+    monkeypatch.setenv("GUARD_ABAC_MATCH_THRESHOLD", "0.99")
     user = _user(session, "user1")
     result = ask(session, user, "which patients use amoxicillin?")
     assert result.chunks, "medicine chunks about amoxicillin are public and allowed"
@@ -141,7 +145,7 @@ def test_admin_gets_patient_chunks(session, offline_engines, flag_log):
 
 
 def test_reject_halts_before_retrieval(session, monkeypatch, flag_log):
-    monkeypatch.setattr(rag, "screen", lambda raw: GuardResult(
+    monkeypatch.setattr(rag, "screen", lambda raw, **kwargs: GuardResult(
         "REJECT", True, ["PROMPT_GUARD_SUSPICIOUS"], _verdict(True), None, None
     ))
     embedded = []
@@ -160,7 +164,7 @@ def test_reject_halts_before_retrieval(session, monkeypatch, flag_log):
 
 
 def test_masked_prompt_is_what_gets_embedded(session, monkeypatch, flag_log):
-    monkeypatch.setattr(rag, "screen", lambda raw: GuardResult(
+    monkeypatch.setattr(rag, "screen", lambda raw, **kwargs: GuardResult(
         "MASKED", True, ["PII_DETECTED"], _verdict(False), None, "email [REDACTED] now"
     ))
     monkeypatch.setattr(rag, "classify", lambda text: _verdict(False))
@@ -182,7 +186,7 @@ def test_masked_query_text_used_not_raw(session, monkeypatch, flag_log):
         captured["text"] = text
         return [1.0] + [0.0] * 383, "fallback", "char-trigram-hash-384"
 
-    monkeypatch.setattr(rag, "screen", lambda raw: GuardResult(
+    monkeypatch.setattr(rag, "screen", lambda raw, **kwargs: GuardResult(
         "MASKED", True, ["PII_DETECTED"], _verdict(False), None, f"masked({raw})"
     ))
     monkeypatch.setattr(rag, "classify", lambda text: _verdict(False))
@@ -243,7 +247,9 @@ def test_flagged_chunk_dropped_from_context(session, offline_engines, monkeypatc
     assert poison.id not in [c.chunk_id for c in result.chunks]
     rows = [json.loads(line) for line in flag_log.read_text().splitlines()]
     injection_rows = [row for row in rows if row.get("event") == "RAG_CONTEXT_INJECTION"]
-    assert injection_rows and injection_rows[0]["chunk_id"] == poison.id
+    assert injection_rows, "a flag row must record the dropped poisoned chunk"
+    assert injection_rows[0]["layer"] == "PROMPT_GUARD"
+    assert injection_rows[0]["details"]["chunk_id"] == poison.id
     assert "ignore all previous instructions" not in json.dumps(injection_rows)
 
 
@@ -255,11 +261,10 @@ def test_rag_query_audit_row_has_no_text(session, offline_engines, flag_log):
     query_rows = [row for row in rows if row.get("event") == "RAG_QUERY"]
     assert len(query_rows) == 1
     row = query_rows[0]
-    assert row["username"] == "admin"
-    assert row["role"] == "admin"
-    assert row["policy_version"] == "1"
-    assert row["permitted_chunks"] == 4
-    assert isinstance(row["top_chunk_ids"], list)
+    assert row["user"] == {"username": "admin", "role": "admin"}
+    assert row["details"]["policy_version"] == "1"
+    assert row["details"]["permitted_chunks"] == 4
+    assert isinstance(row["details"]["top_chunk_ids"], list)
     assert "John Mercer" not in flag_log.read_text()
     assert "Patient:" not in flag_log.read_text()
 
@@ -270,3 +275,43 @@ def test_top_k_env_default(session, offline_engines, monkeypatch, flag_log):
     admin = _user(session, "admin")
     result = ask(session, admin, "medicines and patients")
     assert len(result.chunks) == 1
+
+
+def test_unauthorized_attempt_rejected_with_flag_row(
+    session, offline_engines, monkeypatch, flag_log
+):
+    med_doc, pat_doc = _seed(session)
+    monkeypatch.setenv("GUARD_ABAC_MATCH_THRESHOLD", "0.5")
+    user = _user(session, "user1")
+    result = ask(session, user, "which patients use amoxicillin?")
+    assert result.disposition == "REJECT"
+    assert result.chunks == []
+    assert result.assembled_context is None
+    assert "blocked" in result.message.lower()
+    assert "unauthorized" in result.message.lower()
+    rows = [json.loads(line) for line in flag_log.read_text().splitlines()]
+    flag_rows = [row for row in rows if row.get("event") == "FLAG"]
+    assert len(flag_rows) == 1
+    flag_row = flag_rows[0]
+    assert flag_row["layer"] == "ABAC"
+    assert flag_row["disposition"] == "REJECT"
+    assert flag_row["severity"] == "high"
+    assert flag_row["user"] == {"username": "user1", "role": "user"}
+    assert flag_row["prompt_masked"] == "which patients use amoxicillin?"
+    assert pat_doc.id in flag_row["details"]["restricted_match_ids"]
+    assert flag_row["details"]["restricted_top_score"] >= 0.5
+    assert all(row.get("event") != "RAG_QUERY" for row in rows), (
+        "rejected attempts must not write a RAG_QUERY row"
+    )
+    assert "John Mercer" not in flag_log.read_text(), "restricted text must never be logged"
+
+
+def test_admin_patient_query_not_an_attempt(session, offline_engines, monkeypatch, flag_log):
+    _seed(session)
+    monkeypatch.setenv("GUARD_ABAC_MATCH_THRESHOLD", "0.5")
+    admin = _user(session, "admin")
+    result = ask(session, admin, "which patients use amoxicillin?")
+    assert result.disposition == "CLEAN"
+    assert any("Patient:" in c.text for c in result.chunks)
+    rows = [json.loads(line) for line in flag_log.read_text().splitlines()]
+    assert all(row.get("layer") != "ABAC" for row in rows)

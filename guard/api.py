@@ -20,7 +20,7 @@ from guard.auth import (
 from guard.chat import STATUS_LLM_ERROR, STATUS_REJECTED, ChatResult, chat
 from guard.db import AuditLog, Chunk, Document, User, get_session, init_db
 from guard.logconf import setup_logging
-from guard.rag import AskResult, ask
+from guard.steps.rag import AskResult, ask
 from guard.steps.embedding import get_engine_mode as embedding_engine_mode
 from guard.steps.embedding import embed
 from guard.steps.masking import get_engine_mode as masking_engine
@@ -32,6 +32,8 @@ from guard.steps.prompt_guard import PromptGuardVerdict
 logger = logging.getLogger("guard.api")
 
 REJECT_MESSAGE = "Your request was blocked: jailbreak or prompt-injection detected."
+LLM_REJECT_MESSAGE = "Your request was blocked: policy violation detected."
+ABAC_REJECT_MESSAGE = "Your request was blocked: unauthorized access attempt."
 MASKED_MESSAGE = "Your request was blocked: PII detected."
 CLEAN_MESSAGE = "Screening passed; prompt forwarded as-is."
 
@@ -234,7 +236,7 @@ def screen_prompt(
     request: ScreenRequest,
     current_user: User = Depends(get_current_user),
 ) -> ScreenResponse:
-    result = screen(request.prompt)
+    result = screen(request.prompt, user=current_user)
     message = {
         "REJECT": REJECT_MESSAGE,
         "MASKED": MASKED_MESSAGE,
@@ -346,10 +348,11 @@ def _ask_response(result: AskResult) -> AskResponse:
 
 def _chat_response(result: ChatResult) -> ChatResponse:
     if result.status == STATUS_REJECTED:
-        if result.disposition == "REJECT":
-            message = REJECT_MESSAGE
-        else:
-            message = MASKED_MESSAGE
+        message = {
+            "REJECT": REJECT_MESSAGE,
+            "LLM_REJECT": LLM_REJECT_MESSAGE,
+            "ABAC_REJECT": ABAC_REJECT_MESSAGE,
+        }.get(result.disposition, MASKED_MESSAGE)
     elif result.chunks:
         message = f"Answer generated with {len(result.chunks)} retrieved chunk(s)."
     else:

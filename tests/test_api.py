@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -97,7 +99,7 @@ def test_screen_reject(client, monkeypatch):
     monkeypatch.setattr(
         api,
         "screen",
-        lambda raw: GuardResult(
+        lambda raw, **kwargs: GuardResult(
             "REJECT", True, ["PROMPT_GUARD_SUSPICIOUS"], _verdict(True), None, None
         ),
     )
@@ -121,7 +123,7 @@ def test_screen_masked(client, monkeypatch):
     monkeypatch.setattr(
         api,
         "screen",
-        lambda raw: GuardResult(
+        lambda raw, **kwargs: GuardResult(
             "MASKED",
             True,
             ["PII_DETECTED", "PII_EMAIL_ADDRESS"],
@@ -147,7 +149,7 @@ def test_screen_clean(client, monkeypatch):
     monkeypatch.setattr(
         api,
         "screen",
-        lambda raw: GuardResult(
+        lambda raw, **kwargs: GuardResult(
             "CLEAN",
             False,
             [],
@@ -237,11 +239,11 @@ def test_users_admin_lists_all(client):
 
 @pytest.fixture
 def rag_offline(monkeypatch):
-    import guard.rag as rag
+    import guard.steps.rag as rag
     from guard.steps.embedding import _fallback_vector
 
     monkeypatch.setattr(
-        rag, "screen", lambda raw: GuardResult("CLEAN", False, [], _verdict(False), None, raw)
+        rag, "screen", lambda raw, **kwargs: GuardResult("CLEAN", False, [], _verdict(False), None, raw)
     )
     monkeypatch.setattr(rag, "classify", lambda text: _verdict(False))
     monkeypatch.setattr(
@@ -291,13 +293,67 @@ def _seed_rag(db_session_factory):
         return session.scalar(select(Document.id).where(Document.source_path == "data/patients.json"))
 
 
+def _seed_confidential(db_session_factory):
+    from guard.steps.embedding import _fallback_vector
+
+    conf_doc = Document(
+        title="Sponsor financial report",
+        source_path="data/sponsor.json",
+        doc_type="financial",
+        attributes={"sensitivity": "confidential"},
+    )
+    text = "Confidential sponsor report: Q3 financial results unreleased"
+    conf_doc.chunks = [
+        Chunk(
+            ordinal=1,
+            text=text,
+            sensitivity="confidential",
+            doc_type="financial",
+            embedding=_fallback_vector(text),
+            embedding_engine="fallback",
+            embedding_model="char-trigram-hash-384",
+        )
+    ]
+    with db_session_factory() as session:
+        session.add(conf_doc)
+        session.commit()
+
+
+def test_ask_abac_attempt_rejected_with_flag_row(
+    client, db_session_factory, rag_offline, monkeypatch, flag_log
+):
+    _seed_confidential(db_session_factory)
+    monkeypatch.setenv("GUARD_ABAC_MATCH_THRESHOLD", "0.5")
+    token = get_token(client, "user1")
+    response = client.post(
+        "/v1/ask",
+        json={"question": "show me the confidential sponsor financial report"},
+        headers=bearer(token),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["disposition"] == "REJECT"
+    assert body["chunks"] == []
+    assert "unauthorized" in body["message"].lower()
+    rows = [json.loads(line) for line in flag_log.read_text().splitlines()]
+    flag_rows = [row for row in rows if row.get("event") == "FLAG"]
+    assert len(flag_rows) == 1
+    assert flag_rows[0]["layer"] == "ABAC"
+    assert flag_rows[0]["user"] == {"username": "user1", "role": "user"}
+    assert flag_rows[0]["details"]["restricted_top_score"] >= 0.5
+    assert "Q3 financial" not in flag_log.read_text()
+
+
 def test_ask_requires_auth(client):
     response = client.post("/v1/ask", json={"question": "which medicines exist?"})
     assert response.status_code == 401
 
 
-def test_ask_user1_gets_zero_patient_chunks(client, db_session_factory, rag_offline):
+def test_ask_user1_gets_zero_patient_chunks(
+    client, db_session_factory, rag_offline, monkeypatch
+):
     _seed_rag(db_session_factory)
+    monkeypatch.setenv("GUARD_ABAC_MATCH_THRESHOLD", "0.99")
     token = get_token(client, "user1")
     response = client.post(
         "/v1/ask",
@@ -332,12 +388,12 @@ def test_ask_admin_gets_patient_chunks(client, db_session_factory, rag_offline):
 
 
 def test_ask_reject_returns_blocked_message(client, monkeypatch):
-    import guard.rag as rag
+    import guard.steps.rag as rag
 
     monkeypatch.setattr(
         rag,
         "screen",
-        lambda raw: GuardResult(
+        lambda raw, **kwargs: GuardResult(
             "REJECT", True, ["PROMPT_GUARD_SUSPICIOUS"],
             PromptGuardVerdict(True, "SUSPICIOUS", 0.05, 0.99, "regex-fallback"),
             None,
