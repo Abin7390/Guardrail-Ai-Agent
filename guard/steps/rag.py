@@ -1,4 +1,4 @@
-"""RAG ask orchestrator: screen -> embed -> ABAC-filtered retrieval -> citations.
+"""ABAC-filtered RAG retrieval core used by the unified chat orchestrator.
 
 Retrieval-only: no LLM call. The ABAC predicate is applied inside the SQL
 query (pre-filter, deny-by-default), similarity is cosine in Python over the
@@ -7,9 +7,9 @@ classifier before it can enter the context (indirect-injection defense).
 
 Unauthorized-access detection: the query is also scored against the rows the
 ABAC policy withholds from the requesting user. When the best restricted
-similarity reaches ``GUARD_ABAC_MATCH_THRESHOLD`` the request is treated as an
-access attempt on restricted content: ``ask()`` rejects it and a flag row
-(layer ``ABAC``) is written. Restricted chunk text is never logged.
+similarity reaches ``GUARD_ABAC_MATCH_THRESHOLD`` the outcome reports an
+``unauthorized_attempt`` and the caller rejects the request. Restricted chunk
+text is never logged.
 
 All JSONL rows use the unified schema from :mod:`guard.flags` — ids, counts,
 labels, and the masked query only.
@@ -23,33 +23,23 @@ import numpy as np
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
-from guard.abac import POLICY_VERSION, retrieval_predicate, subject_attributes
+from guard.abac import retrieval_predicate, subject_attributes
 from guard.db import Chunk, Document, User
 from guard.flags import (
     EVENT_RAG_INJECTION,
-    EVENT_RAG_QUERY,
-    LAYER_ABAC,
     LAYER_PROMPT_GUARD,
     append_flag,
     user_block,
-    write_flag,
 )
-from guard.pipeline import screen
 from guard.steps.embedding import embed
 from guard.steps.prompt_guard import PromptGuardVerdict, classify
 
 logger = logging.getLogger("guard.rag")
 
-EVENT_RAG_QUERY = EVENT_RAG_QUERY  # re-exported for callers importing from here
 RULE_RAG_INJECTION = "RAG_CONTEXT_INJECTION"
-RULE_ABAC_ATTEMPT = "ABAC_UNAUTHORIZED_ATTEMPT"
 DEFAULT_TOP_K = 5
 DEFAULT_ABAC_MATCH_THRESHOLD = 0.65
 RESTRICTED_MATCH_LIMIT = 5
-
-REJECT_MESSAGE = "Your request was blocked: jailbreak or prompt-injection detected."
-ABAC_REJECT_MESSAGE = "Your request was blocked: unauthorized access attempt."
-EMPTY_MESSAGE = "no relevant permitted content found"
 
 
 @dataclass(frozen=True)
@@ -84,18 +74,6 @@ class RetrievalOutcome:
     unauthorized_attempt: bool = False
     restricted_top_score: float = 0.0
     restricted_match_ids: list[int] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class AskResult:
-    disposition: str
-    message: str
-    chunks: list[RetrievedChunk]
-    assembled_context: str | None
-    citations: list[Citation]
-    policy_version: str
-    embedding_engine: str | None
-    engine_mismatch: bool
 
 
 def get_top_k() -> int:
@@ -180,8 +158,7 @@ def retrieve(
 ) -> RetrievalOutcome:
     """Embed ``query_text`` (already masked by the caller) and retrieve chunks.
 
-    Shared by ``ask()`` and the unified chat orchestrator. The ABAC predicate
-    applies to ``user``'s DB row (deny-by-default), similarity is cosine over
+    Used by the unified chat orchestrator. The ABAC predicate applies to ``user``'s DB row (deny-by-default), similarity is cosine over
     permitted rows, and every candidate chunk is re-scanned by the Prompt-Guard
     classifier (flagged chunks are dropped and audited). The query is also
     scored against restricted rows to detect unauthorized-access attempts
@@ -285,110 +262,4 @@ def retrieve(
         unauthorized_attempt=unauthorized_attempt,
         restricted_top_score=restricted_top_score,
         restricted_match_ids=restricted_match_ids,
-    )
-
-
-def ask(
-    session: Session,
-    user: User,
-    question: str,
-    top_k: int | None = None,
-) -> AskResult:
-    """Answer one question with permitted, injection-screened chunks."""
-    guarded = screen(question, user=user)
-    if guarded.disposition == "REJECT":
-        return AskResult(
-            disposition="REJECT",
-            message=REJECT_MESSAGE,
-            chunks=[],
-            assembled_context=None,
-            citations=[],
-            policy_version=POLICY_VERSION,
-            embedding_engine=None,
-            engine_mismatch=False,
-        )
-
-    query_text = guarded.masked_prompt or question
-    subject = subject_attributes(user)
-    outcome = retrieve(session, user, query_text, top_k)
-
-    if outcome.unauthorized_attempt:
-        write_flag(
-            layer=LAYER_ABAC,
-            disposition="REJECT",
-            severity="high",
-            reason=(
-                "query strongly matches restricted content outside the "
-                "requester's authorized scope"
-            ),
-            rules=[RULE_ABAC_ATTEMPT],
-            user=user,
-            prompt_masked=query_text,
-            details={
-                "restricted_top_score": outcome.restricted_top_score,
-                "restricted_match_ids": outcome.restricted_match_ids,
-                "threshold": get_abac_threshold(),
-                "policy_version": POLICY_VERSION,
-                "permitted_chunks": outcome.permitted,
-            },
-        )
-        return AskResult(
-            disposition="REJECT",
-            message=ABAC_REJECT_MESSAGE,
-            chunks=[],
-            assembled_context=None,
-            citations=[],
-            policy_version=POLICY_VERSION,
-            embedding_engine=outcome.embedding_engine,
-            engine_mismatch=outcome.engine_mismatch,
-        )
-
-    message = (
-        f"Retrieved {len(outcome.chunks)} permitted chunk(s); context assembled with citations."
-        if outcome.chunks
-        else EMPTY_MESSAGE
-    )
-    if outcome.engine_mismatch:
-        message += (
-            f" [engine mismatch: query embedded with '{outcome.embedding_engine}' but no permitted "
-            "chunks share that engine; re-ingest to re-index]"
-        )
-
-    append_flag(
-        {
-            "event": EVENT_RAG_QUERY,
-            "layer": None,
-            "disposition": guarded.disposition,
-            "severity": "none",
-            "reason": "",
-            "rules": [],
-            "user": user_block(user),
-            "prompt_masked": query_text,
-            "details": {
-                "policy_version": POLICY_VERSION,
-                "permitted_chunks": outcome.permitted,
-                "top_chunk_ids": [chunk.chunk_id for chunk in outcome.chunks],
-                "embedding_engine": outcome.embedding_engine,
-                "dropped_chunk_ids": outcome.dropped_chunk_ids,
-            },
-            "audit_id": None,
-        }
-    )
-    logger.info(
-        "rag | ask complete: disposition=%s permitted=%d kept=%d engine=%s mismatch=%s",
-        guarded.disposition,
-        outcome.permitted,
-        len(outcome.chunks),
-        outcome.embedding_engine,
-        outcome.engine_mismatch,
-    )
-    return AskResult(
-        disposition=guarded.disposition,
-        message=message,
-        chunks=outcome.chunks,
-        assembled_context=outcome.assembled_context,
-        citations=outcome.citations,
-        policy_version=POLICY_VERSION,
-        embedding_engine=outcome.embedding_engine,
-        engine_mismatch=outcome.engine_mismatch,
     )

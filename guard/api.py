@@ -17,7 +17,7 @@ from fastapi import (
     UploadFile,
 )
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from guard.auth import (
@@ -27,15 +27,14 @@ from guard.auth import (
     require_admin,
 )
 from guard.chat import STATUS_LLM_ERROR, STATUS_REJECTED, ChatResult, chat
-from guard.db import AuditLog, Chunk, Document, User, get_session, init_db
+from guard.db import AuditLog, User, get_session, init_db
 from guard.logconf import setup_logging
-from guard.steps.rag import AskResult, ask
 from guard.steps.embedding import get_engine_mode as embedding_engine_mode
 from guard.steps.embedding import embed
 from guard.steps.file_intake import FileIntakeError, intake_files
 from guard.steps.masking import get_engine_mode as masking_engine
 from guard.steps.masking import MaskingResult
-from guard.pipeline import GuardResult, screen
+from guard.pipeline import screen
 from guard.steps.prompt_guard import get_engine_mode as prompt_guard_engine
 from guard.steps.prompt_guard import PromptGuardVerdict
 
@@ -45,13 +44,8 @@ REJECT_MESSAGE = "Your request was blocked: jailbreak or prompt-injection detect
 LLM_REJECT_MESSAGE = "Your request was blocked: policy violation detected."
 ABAC_REJECT_MESSAGE = "Your request was blocked: unauthorized access attempt."
 MASKED_MESSAGE = "Your request was blocked: PII detected."
-CLEAN_MESSAGE = "Screening passed; prompt forwarded as-is."
 
 public_router = APIRouter(prefix="/v1", tags=["public"])
-
-
-class ScreenRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=20000)
 
 
 class VerdictOut(BaseModel):
@@ -64,16 +58,6 @@ class VerdictOut(BaseModel):
 class MaskingOut(BaseModel):
     entities: dict[str, int]
     engine: str
-
-
-class ScreenResponse(BaseModel):
-    disposition: str
-    flagged: bool
-    rules: list[str]
-    message: str
-    masked_prompt: str | None
-    verdict: VerdictOut | None
-    masking: MaskingOut | None
 
 
 class TokenRequestUser(str, Enum):
@@ -104,36 +88,11 @@ class TokenOut(BaseModel):
     user: UserOut
 
 
-class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=20000)
-    top_k: int | None = Field(default=None, ge=1, le=50)
-
-
-class RetrievedChunkOut(BaseModel):
-    chunk_id: int
-    document_id: int
-    ordinal: int
-    title: str
-    text: str
-    score: float
-
-
 class CitationOut(BaseModel):
     document_id: int
     chunk_id: int
     title: str
     score: float
-
-
-class AskResponse(BaseModel):
-    disposition: str
-    message: str
-    chunks: list[RetrievedChunkOut]
-    assembled_context: str | None
-    citations: list[CitationOut]
-    policy_version: str
-    embedding_engine: str | None
-    engine_mismatch: bool
 
 
 class ChatRequest(BaseModel):
@@ -180,16 +139,6 @@ class AuditOut(BaseModel):
     rag: dict | None
     llm: dict | None
     demasking: dict | None
-
-
-class DocumentOut(BaseModel):
-    id: int
-    title: str
-    source_path: str
-    doc_type: str
-    attributes: dict
-    chunk_count: int
-    created_at: datetime
 
 
 @asynccontextmanager
@@ -253,38 +202,6 @@ def list_users(
     return [UserOut.model_validate(user) for user in users]
 
 
-# @public_router.post("/screen", response_model=ScreenResponse)
-# def screen_prompt(
-#     request: ScreenRequest,
-#     current_user: User = Depends(get_current_user),
-# ) -> ScreenResponse:
-#     result = screen(request.prompt, user=current_user)
-#     message = {
-#         "REJECT": REJECT_MESSAGE,
-#         "MASKED": MASKED_MESSAGE,
-#         "CLEAN": CLEAN_MESSAGE,
-#     }[result.disposition]
-#     return ScreenResponse(
-#         disposition=result.disposition,
-#         flagged=result.flagged,
-#         rules=result.rules,
-#         message=message,
-#         masked_prompt=result.masked_prompt,
-#         verdict=_verdict_out(result.verdict),
-#         masking=_masking_out(result.masking),
-#     )
-
-
-# @public_router.post("/ask", response_model=AskResponse)
-# def ask_question(
-#     request: AskRequest,
-#     current_user: User = Depends(get_current_user),
-#     session: Session = Depends(get_session),
-# ) -> AskResponse:
-#     result = ask(session, current_user, request.question, request.top_k)
-#     return _ask_response(result)
-
-
 @public_router.post("/chat", response_model=ChatResponse)
 def chat_prompt(
     request: ChatRequest,
@@ -344,62 +261,6 @@ def list_audit(
         select(AuditLog).order_by(AuditLog.id.desc()).limit(limit)
     ).all()
     return [AuditOut.model_validate(row) for row in rows]
-
-
-# @public_router.get("/documents", response_model=list[DocumentOut])
-# def list_documents(
-#     session: Session = Depends(get_session),
-#     _admin: User = Depends(require_admin),
-# ) -> list[DocumentOut]:
-#     rows = session.execute(
-#         select(Document, func.count(Chunk.id))
-#         .outerjoin(Chunk, Chunk.document_id == Document.id)
-#         .group_by(Document.id)
-#         .order_by(Document.id)
-#     ).all()
-#     return [
-#         DocumentOut(
-#             id=document.id,
-#             title=document.title,
-#             source_path=document.source_path,
-#             doc_type=document.doc_type,
-#             attributes=document.attributes or {},
-#             chunk_count=count,
-#             created_at=document.created_at,
-#         )
-#         for document, count in rows
-#     ]
-
-
-def _ask_response(result: AskResult) -> AskResponse:
-    return AskResponse(
-        disposition=result.disposition,
-        message=result.message,
-        chunks=[
-            RetrievedChunkOut(
-                chunk_id=chunk.chunk_id,
-                document_id=chunk.document_id,
-                ordinal=chunk.ordinal,
-                title=chunk.title,
-                text=chunk.text,
-                score=chunk.score,
-            )
-            for chunk in result.chunks
-        ],
-        assembled_context=result.assembled_context,
-        citations=[
-            CitationOut(
-                document_id=citation.document_id,
-                chunk_id=citation.chunk_id,
-                title=citation.title,
-                score=citation.score,
-            )
-            for citation in result.citations
-        ],
-        policy_version=result.policy_version,
-        embedding_engine=result.embedding_engine,
-        engine_mismatch=result.engine_mismatch,
-    )
 
 
 def _chat_response(result: ChatResult) -> ChatResponse:
