@@ -1,0 +1,36 @@
+[
+  {
+    "patient_name": "John Mercer",
+    "medicines_used": ["Amoxicillin", "Paracetamol"],
+    "prescribed_by": "Dr. Alice Feldman",
+    "notes": "Course completes 2026-10-02; follow-up if fever persists"
+  },
+  {
+    "patient_name": "Priya Nair",
+    "medicines_used": ["Metformin", "Atorvastatin"],
+    "prescribed_by": "Dr. Samuel Osei",
+    "notes": "Quarterly HbA1c monitoring"
+  },
+  {
+    "patient_name": "Luis Ortega",
+    "medicines_used": ["Amoxicillin", "Omeprazole"],
+    "prescribed_by": "Dr. Alice Feldman"
+  },
+  {
+    "patient_name": "Fatima Zahra",
+    "medicines_used": ["Salbutamol", "Cetirizine"],
+    "prescribed_by": "Dr. Marta Kowalski",
+    "notes": "Inhaler technique reviewed; spacer recommended"
+  },
+  {
+    "patient_name": "Chen Wei",
+    "medicines_used": ["Amlodipine", "Ibuprofen"],
+    "prescribed_by": "Dr. Samuel Osei",
+    "notes": "Advised to take ibuprofen with food"
+  },
+  {
+    "patient_name": "Grace Odili",
+    "medicines_used": ["Azithromycin"],
+    "prescribed_by": "Dr. Marta Kowalski"
+  }
+]

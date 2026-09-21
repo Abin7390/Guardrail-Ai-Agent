@@ -1,0 +1,62 @@
+[
+  {
+    "name": "Amoxicillin",
+    "usage": "Antibiotic for bacterial infections of the ear, nose, throat, and urinary tract",
+    "category": "antibiotic",
+    "dosage_form": "capsule"
+  },
+  {
+    "name": "Paracetamol",
+    "usage": "Pain reliever and fever reducer for headaches, muscle aches, and mild arthritis",
+    "category": "analgesic",
+    "dosage_form": "tablet"
+  },
+  {
+    "name": "Ibuprofen",
+    "usage": "Non-steroidal anti-inflammatory for pain, fever, and inflammation",
+    "category": "analgesic",
+    "dosage_form": "tablet"
+  },
+  {
+    "name": "Metformin",
+    "usage": "First-line treatment for type 2 diabetes; lowers blood glucose",
+    "category": "antidiabetic",
+    "dosage_form": "tablet"
+  },
+  {
+    "name": "Atorvastatin",
+    "usage": "Lowers LDL cholesterol and reduces cardiovascular risk",
+    "category": "statin",
+    "dosage_form": "tablet"
+  },
+  {
+    "name": "Omeprazole",
+    "usage": "Proton pump inhibitor for acid reflux and stomach ulcers",
+    "category": "gastrointestinal",
+    "dosage_form": "capsule"
+  },
+  {
+    "name": "Cetirizine",
+    "usage": "Antihistamine for allergies and hay fever symptoms",
+    "category": "antihistamine",
+    "dosage_form": "tablet"
+  },
+  {
+    "name": "Salbutamol",
+    "usage": "Bronchodilator inhaler for rapid relief of asthma symptoms",
+    "category": "respiratory",
+    "dosage_form": "inhaler"
+  },
+  {
+    "name": "Amlodipine",
+    "usage": "Calcium channel blocker for high blood pressure and angina",
+    "category": "cardiovascular",
+    "dosage_form": "tablet"
+  },
+  {
+    "name": "Azithromycin",
+    "usage": "Broad-spectrum antibiotic for respiratory and skin infections",
+    "category": "antibiotic",
+    "dosage_form": "tablet"
+  }
+]

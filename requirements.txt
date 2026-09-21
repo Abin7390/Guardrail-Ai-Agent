@@ -1,0 +1,16 @@
+transformers
+sentence-transformers
+presidio-analyzer
+presidio-anonymizer
+spacy
+fastapi
+uvicorn
+httpx
+pytest
+sqlalchemy
+psycopg[binary]
+pyjwt
+google-genai
+python-dotenv
+pypdf
+python-multipart

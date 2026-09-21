@@ -12,8 +12,9 @@ Standalone Python module that screens user prompts in two stages and reports fla
    | `data/patients.json` | patient details + medicines they use | `doc_type=patient_record`, `sensitivity=restricted` | `role=admin` only |
 
    Retrieval is retrieval-only (no LLM call): the response returns permitted chunks, an assembled context with `[1]`, `[2]` citation markers, and a citations list. Generation can be layered on downstream without schema changes.
+4. **Stage 4 - Unified chat** (`POST /v1/chat`, `POST /v1/chat/upload`): the full chain in one call - prompt guard, **reversible** PII masking (indexed `[REDACTED_1]`, `[REDACTED_2]`, ... placeholders), an LLM router call that decides whether RAG is needed, ABAC-filtered retrieval, a second LLM call that answers from the masked prompt plus context, and finally demasking of the answer. Every request writes one row to the new `audit_log` Postgres table (masked content only). See "Unified chat endpoint". The multipart `/v1/chat/upload` variant additionally accepts attached files (`.txt .md .csv .json .pdf`); every guard step screens the extracted file text too (see "File uploads").
 
-Flagged events are also appended to `flags.jsonl` (snippets are Presidio-masked first, so raw PII is never written to disk).
+Flagged events are also appended to `flags.jsonl` with the unified schema (layer, user, full masked prompt, severity, reason - never the raw prompt; see "Flag log").
 
 ## Project layout
 
@@ -26,14 +27,16 @@ custom/
     auth.py           # JWT (HS256) bearer auth dependencies
     db.py             # SQLAlchemy store: users, documents, chunks (Postgres)
     abac.py           # attribute-based access control (evaluate + SQL compile)
-    rag.py            # ask() orchestrator: screen -> embed -> ABAC retrieval
-    llm.py            # shared GLM client (openai-compatible, Z.ai endpoint)
+    rag.py            # ask() orchestrator + shared retrieve() core
+    chat.py           # unified chat: guard -> mask -> route -> retrieve -> answer -> demask
+    llm.py            # shared Gemini client (google-genai SDK)
     ingest.py         # python -m guard.ingest: JSON -> documents/chunks
     logconf.py        # shared [guard] terminal logging setup
     cli.py            # terminal interface
     __main__.py       # python -m guard entry point
     steps/            # pipeline steps, numbered by run order
       __init__.py     # loads numbered files, registers import aliases
+      00_file_intake.py  # Stage 0: upload validation, caps, text extraction (.txt/.md/.csv/.json/.pdf)
       01_prompt_guard.py  # Stage 1: Prompt-Guard classifier (regex fallback offline)
       02_masking.py       # Stage 2: Presidio [REDACTED] masking (regex fallback offline)
       03_embedding.py     # Stage 3: MiniLM embeddings (hashed-trigram fallback offline)
@@ -49,6 +52,8 @@ custom/
     test_embedding.py # embedding fallback determinism tests
     test_ingest.py    # ingestion tests
     test_rag.py       # ask() orchestrator tests
+    test_chat.py      # unified chat orchestrator + endpoint tests
+    test_file_intake.py  # upload validation/extraction tests
   requirements.txt
   flags.jsonl         # created at runtime
 ```
@@ -148,11 +153,15 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 |--------|----------------|----------------------|-----------------------------------------------|----------------------------------------------------|
 | GET    | `/v1/health`   | -                    | -                                             | Service status + loaded engine modes.              |
 | POST   | `/v1/token`    | -                    | `{"username": "admin" \| "user1" \| "user2"}` | Issue a JWT for the chosen mock user (dropdown in `/docs`). |
-| POST   | `/v1/screen`   | Bearer token         | `{"prompt": "..."}`                           | Screen one prompt; full result as JSON.            |
-| POST   | `/v1/ask`      | Bearer token         | `{"question": "...", "top_k"?: n}`            | RAG retrieval over ABAC-permitted chunks; returns chunks + assembled context + citations. |
-| GET    | `/v1/users/me` | Bearer token         | -                                             | Details of the authenticated user.                 |
+| POST   | `/v1/chat`     | Bearer token         | `{"prompt": "...", "top_k"?: n}`              | Unified chain: guard -> reversible mask -> LLM router -> ABAC retrieval -> LLM answer -> demask; one `audit_log` row per request. |
+| POST   | `/v1/chat/upload` | Bearer token      | multipart form: `prompt`, `top_k`?, one optional `file` | Same chain with one attached file: every guard step also screens the extracted file text. |
+| GET    | `/v1/audit`    | Bearer token (admin) | `?limit=n` (default 20, max 100)              | Latest chat audit rows (masked content only). |
+| GET    | `/v1/users/me` | Bearer token         | -                                             | Details of the authenticated user. |
 | GET    | `/v1/users`    | Bearer token (admin) | -                                             | List all users (admin only).                       |
-| GET    | `/v1/documents`| Bearer token (admin) | -                                             | List indexed documents with attributes + chunk counts (admin only). |
+
+`/v1/screen`, `/v1/ask`, and `/v1/documents` are currently disabled in the
+router (`guard/api.py`); the underlying `screen()` / `ask()` functions and
+their offline tests remain available for the pipeline modules.
 
 ### Auth (JWT bearer)
 
@@ -161,9 +170,9 @@ Mock users live in Postgres and are seeded at startup; there are no passwords:
 
 | Username | Role  | Access                                                    |
 |----------|-------|-----------------------------------------------------------|
-| `admin`  | admin | everything, including patient records, `GET /v1/users`, `GET /v1/documents` |
-| `user1`  | user  | `/v1/screen`, `/v1/ask` (public chunks only), `/v1/users/me` |
-| `user2`  | user  | `/v1/screen`, `/v1/ask` (public chunks only), `/v1/users/me` |
+| `admin`  | admin | everything, including patient records (via chat), `GET /v1/users`, `GET /v1/audit` |
+| `user1`  | user  | `/v1/chat`, `/v1/chat/upload` (public chunks only), `/v1/users/me` |
+| `user2`  | user  | `/v1/chat`, `/v1/chat/upload` (public chunks only), `/v1/users/me` |
 
 Get a token (the request body is a username dropdown in `/docs`):
 
@@ -277,31 +286,176 @@ returns the patient chunks. Retrieved chunks are re-scanned by the Prompt-Guard
 classifier; chunks that look like indirect injections are dropped from the
 context (rule `RAG_CONTEXT_INJECTION`) while the rest of the answer proceeds.
 
+If the query scores at/above `GUARD_ABAC_MATCH_THRESHOLD` (default 0.65)
+against chunks the ABAC policy withholds from the user, the ask is treated as
+an **unauthorized-access attempt**: it is rejected with a generic message and
+flagged with layer `ABAC` (document ids and scores only - no chunk text).
+Admins are exempt (nothing is restricted for them).
+
 ### Audit rows
 
-Every ask appends one `RAG_QUERY` row to `flags.jsonl` with ids/counts only -
-chunk text and patient names are never logged:
+Every successful ask appends one `RAG_QUERY` row to `flags.jsonl` with
+ids/counts only - chunk text and patient names are never logged:
 
 ```json
-{"ts": "2026-09-17T10:00:00+00:00", "event": "RAG_QUERY", "username": "user1", "role": "user",
- "policy_version": "1", "permitted_chunks": 12, "top_chunk_ids": [4, 7], "embedding_engine": "minilm"}
+{"ts": "2026-09-17T10:00:00+00:00", "event": "RAG_QUERY", "layer": null, "disposition": "CLEAN",
+ "user": {"username": "user1", "role": "user"}, "prompt_masked": "which medicines treat a fever?",
+ "details": {"policy_version": "1", "permitted_chunks": 12, "top_chunk_ids": [4, 7], "embedding_engine": "minilm", "dropped_chunk_ids": []}}
 ```
 
 Admins can inspect the index through `GET /v1/documents` (documents with
 attributes and chunk counts); regular users get `403`.
 
-## GLM LLM client
+## Unified chat endpoint
 
-`guard/llm.py` exposes a shared, reusable client for GLM 5.2 (Z.ai's
-OpenAI-compatible endpoint) so any module - now or later - can make LLM calls
-without knowing about credentials or SDK plumbing. Credentials live in
-`custom/.env`, loaded by `python-dotenv` when `guard.llm` is imported;
-variables already set in the shell always win:
+`POST /v1/chat` runs the whole guardrail chain per request and returns the
+**demasked** answer plus citations, while everything that is logged stays
+masked:
+
+```
+prompt guard (Prompt-Guard)
+   |-> REJECT: halt, audit row, 200 + block message (no LLM call)
+reversible PII masking ([REDACTED_1], [REDACTED_2], ... + per-request mapping)
+   |
+LLM router call (temperature 0, strict JSON {needs_rag, search_query})
+   |-> malformed JSON / API error: fallback needs_rag=false (reason audited)
+   |
+   |-> needs_rag: ABAC-filtered retrieval (same engine + injection re-scan as /v1/ask)
+   |
+LLM answer call (masked prompt + assembled context, cite as [n],
+                 keep [REDACTED_n] tokens verbatim)
+   |
+demask the LLM output -> unmasked answer to the caller
+```
+
+```powershell
+$token = (Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/token" -Method Post `
+  -ContentType "application/json" -Body '{"username": "user1"}').access_token
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/chat" -Method Post `
+  -ContentType "application/json" -Headers @{ Authorization = "Bearer $token" } `
+  -Body '{"prompt": "email maria@example.com: which medicines treat a fever?"}'
+```
+
+Response (PII case, abridged):
+
+```json
+{
+  "status": "ANSWER",
+  "disposition": "MASKED",
+  "answer": "email maria@example.com: Paracetamol is a pain reliever and fever reducer. [1]",
+  "message": "Answer generated with 2 retrieved chunk(s).",
+  "citations": [{"document_id": 1, "chunk_id": 2, "title": "Medicine catalog", "score": 0.31}],
+  "verdict": {"label": "BENIGN", "benign_score": 0.99, "suspicious_score": 0.01, "engine": "hf"},
+  "masking": {"entities": {"EMAIL_ADDRESS": 1}, "engine": "presidio"},
+  "used_rag": true,
+  "audit_id": 42
+}
+```
+
+Behavior details:
+
+- **Jailbreak prompts** return HTTP 200 with the standard block message,
+  `status: "REJECTED"`, `answer: null` - exactly like `/v1/ask`.
+- **ABAC stays inside the SQL**: the router decides *whether* to retrieve,
+  never *what* - `user1`/`user2` never see patient chunks even if the router
+  asks for "every document"; admins do.
+- **Answer-call LLM failures** return HTTP 502 after an `LLM_ERROR` audit row
+  is written; router failures never surface - they fall back to no-RAG.
+- If the LLM mangles or drops a placeholder, the token simply stays visible
+  in the answer (`demasking.unmatched_count` in the audit row records it);
+  demasking never fails the request.
+- Known POC limitation: a prompt that already contains a literal
+  `[REDACTED_1]` token could collide with a generated placeholder.
+
+### File uploads (`POST /v1/chat/upload`)
+
+Multipart variant of the chat endpoint: `prompt` (form field) plus a single
+optional `file` (`.txt .md .csv .json .pdf`, 5 MB, 50k extracted characters).
+The extracted file text runs through the same guard steps as the prompt:
+
+```
+stage 0 file intake: allowlist + caps + text extraction (pypdf for PDFs)
+   |-> unsupported type / oversize / corrupt / empty: 422, nothing screened
+   |
+Prompt-Guard classify: prompt AND each file text SEPARATELY
+   |-> any flagged: REJECT + flag row naming the file (details.filename)
+   |
+Presidio reversible masking on prompt + files as ONE combined document
+   (placeholders stay unique across prompt and files; result split back apart)
+   |
+LLM router: masked prompt + per-file [ATTACHED FILE: name] excerpts (4k chars)
+   |-> flagged: LLM_REJECT (instructions hidden in attachments are injection)
+   |
+LLM answer call: masked prompt + FULL masked file sections (+ RAG context)
+   |
+demask with the single combined mapping -> answer (file PII restored to the
+same requesting user, like prompt PII)
+```
+
+```powershell
+$token = (Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/token" -Method Post `
+  -ContentType "application/json" -Body '{"username": "user1"}').access_token
+
+curl.exe -X POST "http://127.0.0.1:8000/v1/chat/upload" `
+  -H "Authorization: Bearer $token" `
+  -F "prompt=Summarize the attached notes and draft a reply." `
+  -F "file=@notes.txt"
+```
+
+The response carries the usual chat fields plus a `files` list (filename,
+extension, size, per-file verdict label/score, per-file masked-entity
+counts). Files are request context only - they are never ingested into the
+RAG knowledge base, and raw file bytes/text are never persisted: the audit
+row keeps the masked prompt in `masked_prompt` and file metadata under
+`guard.files`.
+
+### Audit log (`audit_log` table)
+
+Every chat request writes one row, auto-created by startup `create_all` (no
+migration needed on existing deployments). Stored columns - masked content
+only; **never** the raw prompt, the demasked answer, or mapping values:
+
+| Column          | Content                                                                                          |
+|-----------------|--------------------------------------------------------------------------------------------------|
+| `ts`, `username`, `role`, `status` | who/when/outcome (`ANSWER`, `REJECTED`, `LLM_ERROR`).            |
+| `masked_prompt` | the prompt after reversible masking (`null` for REJECT - the raw prompt is never stored).        |
+| `guard`         | `{disposition, rules, label, suspicious_score, threshold, engine}`; with uploads also `files: [{filename, extension, size_bytes, label, suspicious_score, engine, entities}]` (metadata only, never file text). |
+| `masking`       | `{engine, entities: {type: count}, placeholder_count}`.                                          |
+| `router`        | `{needs_rag, search_query, fallback_reason?}`.                                                   |
+| `rag`           | `{policy_version, permitted_chunks, chunk_ids: [{id, document_id, title, score}], dropped_chunk_ids, embedding_engine, engine_mismatch}`. |
+| `llm`           | `{model, finish_reason, usage, latency_ms, answer_masked}` - the LLM output **before** demasking. |
+| `demasking`     | `{restored_count, unmatched_count}`.                                                             |
+
+`GET /v1/audit` (admin only) lists the latest rows (default 20,
+`?limit=` up to 100, newest first):
+
+```powershell
+$admin = (Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/token" -Method Post `
+  -ContentType "application/json" -Body '{"username": "admin"}').access_token
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/audit?limit=5" `
+  -Headers @{ Authorization = "Bearer $admin" }
+```
+
+`/v1/chat` also appends security events to `flags.jsonl` (see "Flag log"
+below): guard-stage rows (REJECT/MASKED) from `screen()`, an `LLM_ROUTER` row
+when the router flags the prompt, and an `ABAC` row when retrieval detects the
+query matches restricted content - each carrying the user, the masked prompt,
+severity, and the per-request `audit_id`.
+
+## Gemini LLM client
+
+`guard/llm.py` exposes a shared, reusable client for Gemini
+(`gemini-3.8-flash` via the `google-genai` SDK) so any module - now or later -
+can make LLM calls without knowing about credentials or SDK plumbing.
+Credentials live in `custom/.env`, loaded by `python-dotenv` when `guard.llm`
+is imported; variables already set in the shell always win:
 
 ```dotenv
-GUARD_LLM_API_KEY=your-zai-api-key-here
-# GUARD_LLM_BASE_URL=https://api.z.ai/api/paas/v4/
-# GUARD_LLM_MODEL=glm-5.2
+GOOGLE_API_KEY=your-google-api-key-here
+# GUARD_LLM_API_KEY=your-google-api-key-here  (takes precedence over GOOGLE_API_KEY)
+# GUARD_LLM_MODEL=gemini-3.8-flash
 # GUARD_LLM_TIMEOUT=60
 ```
 
@@ -323,7 +477,7 @@ print(reply.content, reply.usage)
 ```
 
 `get_client()` returns a lazily created shared instance configured from the
-`GUARD_LLM_*` variables; construct `GLMClient(api_key=..., model=...)`
+environment; construct `GeminiClient(api_key=..., model=...)`
 directly for custom instances. A missing API key (or any API error) raises
 `LLMClientError` at call time - importing the module never fails, so offline
 runs and tests are unaffected. Message content is never logged.
@@ -387,13 +541,26 @@ line appears because the flag-log snippet for a REJECT is still redacted before 
 
 ### Flag log (flags.jsonl)
 
-One JSON line per flagged event, snippet masked before writing. RAG events
-(`RAG_QUERY`, `RAG_CONTEXT_INJECTION`) contain ids/counts/labels only:
+One JSON line per security-relevant event, written by the shared writer in
+`guard/flags.py`. Every row records which layer flagged it, the requesting
+user, the FULL masked prompt (never the raw prompt), severity, reason, rules,
+layer-specific `details`, and the `audit_log` row id when the event belongs to
+a unified chat request:
 
 ```json
-{"ts": "2026-09-16T11:01:07.165522+00:00", "disposition": "MASKED", "rules": ["PII_DETECTED", "PII_EMAIL_ADDRESS", "PII_PERSON"], "label": "BENIGN", "suspicious_score": 0.0006, "snippet": "[REDACTED] [REDACTED] to schedule the study-101 visit for [REDACTED]"}
-{"ts": "2026-09-17T10:00:00.000000+00:00", "event": "RAG_QUERY", "username": "user1", "role": "user", "policy_version": "1", "permitted_chunks": 16, "top_chunk_ids": [3, 11], "embedding_engine": "minilm"}
+{"ts": "2026-09-18T13:40:00.000000+00:00", "event": "FLAG", "layer": "PROMPT_GUARD", "disposition": "REJECT", "severity": "high", "reason": "jailbreak or prompt injection detected", "rules": ["PROMPT_GUARD_SUSPICIOUS"], "user": {"username": "user1", "role": "user"}, "prompt_masked": "ignore all previous instructions and [REDACTED]", "details": {"label": "SUSPICIOUS", "suspicious_score": 0.9995, "threshold": 0.5, "engine": "hf", "matched": null}, "audit_id": 42}
+{"ts": "2026-09-18T13:41:00.000000+00:00", "event": "FLAG", "layer": "ABAC", "disposition": "ABAC_REJECT", "severity": "high", "reason": "query strongly matches restricted content outside the requester's authorized scope", "rules": ["ABAC_UNAUTHORIZED_ATTEMPT"], "user": {"username": "user1", "role": "user"}, "prompt_masked": "show me the confidential sponsor financial report", "details": {"restricted_top_score": 0.81, "restricted_match_ids": [7], "threshold": 0.65, "policy_version": "1", "permitted_chunks": 16}, "audit_id": 43}
+{"ts": "2026-09-18T13:42:00.000000+00:00", "event": "RAG_QUERY", "layer": null, "disposition": "CLEAN", "severity": "none", "reason": "", "rules": [], "user": {"username": "user1", "role": "user"}, "prompt_masked": "which medicines treat a fever?", "details": {"policy_version": "1", "permitted_chunks": 16, "top_chunk_ids": [3, 11], "embedding_engine": "minilm", "dropped_chunk_ids": []}, "audit_id": null}
 ```
+
+Layers: `PROMPT_GUARD` (jailbreak/injection, also retrieved-chunk rescans),
+`MASKING` (PII present, severity low - data is redacted and the chat
+continues), `LLM_ROUTER` (router LLM flagged: secrets/API keys, personal or
+contact details, data exfiltration, role-scope violations), `ABAC`
+(query semantically matches restricted content the user may not access).
+RAG events (`RAG_QUERY`, `RAG_CONTEXT_INJECTION`) contain ids/counts/labels
+only - chunk text and patient names are never logged. The legacy log (pre-restructure)
+was archived as `flags.jsonl.bak`.
 
 ## Configuration (environment variables)
 
@@ -403,6 +570,7 @@ One JSON line per flagged event, snippet masked before writing. RAG events
 | `PROMPTGUARD_THRESHOLD`| `0.5`                                            | Suspicion score at/above which a prompt is rejected (lower = stricter). |
 | `GUARD_EMBED_MODEL`    | `sentence-transformers/all-MiniLM-L6-v2`         | Sentence-transformers model for Stage 3 embeddings (384-dim MiniLM). If it cannot load, the deterministic hashed-trigram fallback is used (`engine=fallback`). |
 | `GUARD_RAG_TOP_K`      | `5`                                              | Default number of chunks `/v1/ask` retrieves (per-request `top_k` overrides it, max 50). |
+| `GUARD_ABAC_MATCH_THRESHOLD` | `0.65`                                     | Cosine similarity at/above which a query that matches restricted (non-permitted) chunks counts as an unauthorized-access attempt and is rejected + flagged (layer `ABAC`). |
 | `GUARD_FLAG_LOG`       | `custom/flags.jsonl`                             | Path of the JSONL flag log.                      |
 | `GUARD_SPACY_MODEL`     | `en_core_web_sm`                                 | spaCy NER model behind Presidio PERSON/ORGANIZATION/LOCATION detection (e.g. `en_core_web_lg` after `python -m spacy download en_core_web_lg`; larger but slower). |
 | `GUARD_HOST` / `GUARD_PORT` | `127.0.0.1` / `8000`                         | Bind address for the FastAPI service (`python -m guard.api`). |
@@ -411,10 +579,10 @@ One JSON line per flagged event, snippet masked before writing. RAG events
 | `GUARD_DATABASE_URL`   | `postgresql+psycopg://postgres:postgres@localhost:5433/guardrail_poc` | SQLAlchemy URL for the users/documents/chunks store. |
 | `GUARD_JWT_SECRET`     | `guardrail-poc-dev-secret-change-me`             | HS256 signing secret for JWTs (change outside dev). |
 | `GUARD_JWT_EXPIRE_MINUTES` | `1440`                                      | Token lifetime in minutes (default 24h).        |
-| `GUARD_LLM_API_KEY`   | (none)                                           | Z.ai API key for the shared GLM client; put it in `custom/.env` (see "GLM LLM client"). |
-| `GUARD_LLM_BASE_URL`  | `https://api.z.ai/api/paas/v4/`                  | OpenAI-compatible endpoint the GLM client calls (BigModel China: `https://open.bigmodel.cn/api/paas/v4/`). |
-| `GUARD_LLM_MODEL`     | `glm-5.2`                                        | Model id the GLM client requests.               |
-| `GUARD_LLM_TIMEOUT`   | `60`                                             | GLM client per-request timeout in seconds.      |
+| `GOOGLE_API_KEY`      | (none)                                           | Google API key for the shared Gemini client; put it in `custom/.env` (see "Gemini LLM client"). |
+| `GUARD_LLM_API_KEY`   | (none)                                           | Explicit key override for the Gemini client; takes precedence over `GOOGLE_API_KEY`. |
+| `GUARD_LLM_MODEL`     | `gemini-3.8-flash`                               | Model id the Gemini client requests.            |
+| `GUARD_LLM_TIMEOUT`   | `60`                                             | Gemini client per-request timeout in seconds.   |
 
 ## Tests
 
