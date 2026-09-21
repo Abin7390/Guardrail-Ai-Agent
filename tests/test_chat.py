@@ -22,6 +22,7 @@ from guard.db import AuditLog, Chunk, Document, User, get_session, init_db
 from guard.llm import LLMClientError, LLMResponse
 from guard.pipeline import GuardResult
 from guard.steps.embedding import _fallback_vector
+from guard.steps.file_intake import ExtractedFile
 from guard.steps.masking import MaskedEntity, MaskingResult
 from guard.steps.prompt_guard import PromptGuardVerdict
 
@@ -75,6 +76,51 @@ def _masked_guard(raw, reversible=False, user=None):
         MaskingResult(masked, {"EMAIL_ADDRESS": 1}, "presidio", mapping),
         masked,
     )
+
+
+_FILES_REPORT = [
+    {
+        "filename": "notes.txt",
+        "extension": ".txt",
+        "size_bytes": 42,
+        "label": "BENIGN",
+        "suspicious_score": 0.01,
+        "engine": "regex-fallback",
+        "entities": {"EMAIL_ADDRESS": 1},
+    }
+]
+_MASKED_FILES = [("notes.txt", "contact [REDACTED_1] about the study")]
+
+
+def _files_guard(raw, files=None, reversible=False, user=None):
+    mapping = [MaskedEntity("EMAIL_ADDRESS", "jane@clinic.example", "[REDACTED_1]")]
+    return GuardResult(
+        "MASKED",
+        True,
+        ["PII_DETECTED", "PII_EMAIL_ADDRESS"],
+        _verdict(False),
+        MaskingResult(raw, {"EMAIL_ADDRESS": 1}, "presidio", mapping),
+        raw,
+        _FILES_REPORT,
+        _MASKED_FILES,
+    )
+
+
+def _file_reject_guard(raw, files=None, reversible=False, user=None):
+    return GuardResult(
+        "REJECT",
+        True,
+        ["PROMPT_GUARD_SUSPICIOUS", "FILE_PROMPT_GUARD_SUSPICIOUS"],
+        _verdict(True),
+        None,
+        None,
+        _FILES_REPORT,
+        None,
+    )
+
+
+def _extracted(name: str = "notes.txt", text: str = "raw file body") -> ExtractedFile:
+    return ExtractedFile(name, ".txt", len(text), text)
 
 
 class FakeGemini:
@@ -659,3 +705,82 @@ def test_admin_confidential_query_not_rejected_by_abac(
         assert result.status == "ANSWER"
         assert result.chunks, "admin may retrieve the confidential chunk"
         assert not flag_log.exists(), "no flag row for an admin-scoped query"
+
+
+def test_chat_with_files_routes_and_answers_with_file_sections(
+    session_factory, monkeypatch, flag_log
+):
+    monkeypatch.setattr(chat_module, "screen_request", _files_guard)
+    fake = FakeGemini(
+        [
+            _router_json(False),
+            _answer("Noted, following up on [REDACTED_1]."),
+        ]
+    )
+    _use_fake_llm(monkeypatch, fake)
+    with session_factory() as session:
+        result = chat(
+            session,
+            _user(session, "user1"),
+            "summarize my notes",
+            files=[_extracted()],
+        )
+        assert result.status == "ANSWER"
+        assert result.files == _FILES_REPORT
+        # router sees the masked prompt plus an [ATTACHED FILE] excerpt
+        router_content = fake.calls[0]["messages"][0]["content"]
+        assert router_content.startswith("[USER MESSAGE]\n\nsummarize my notes")
+        assert "[ATTACHED FILE: notes.txt]" in router_content
+        assert "contact [REDACTED_1] about the study" in router_content
+        # answer LLM sees the full masked file section
+        answer_content = fake.calls[1]["messages"][0]["content"]
+        assert answer_content.startswith("summarize my notes")
+        assert "[ATTACHED FILE: notes.txt]" in answer_content
+        # demasking restores the file-sourced placeholder to the same user
+        assert result.answer_demasked == "Noted, following up on jane@clinic.example."
+        row = session.get(AuditLog, result.audit_id)
+        assert row.masked_prompt == "summarize my notes", "audit stores prompt only"
+        assert row.guard["files"] == _FILES_REPORT
+        stored = _stored_columns(row)
+        assert "jane@clinic.example" not in stored
+        assert "raw file body" not in stored
+
+
+def test_chat_file_reject_halts_before_any_llm_call(
+    session_factory, monkeypatch, flag_log
+):
+    monkeypatch.setattr(chat_module, "screen_request", _file_reject_guard)
+    fake = FakeGemini([])
+    _use_fake_llm(monkeypatch, fake)
+    with session_factory() as session:
+        result = chat(
+            session,
+            _user(session, "user1"),
+            "what do my notes say?",
+            files=[_extracted()],
+        )
+        assert result.status == "REJECTED"
+        assert result.disposition == "REJECT"
+        assert result.files == _FILES_REPORT
+        assert fake.calls == [], "file-triggered REJECT must halt before the router"
+        row = session.get(AuditLog, result.audit_id)
+        assert row.status == "REJECTED"
+        assert row.guard["files"] == _FILES_REPORT
+        assert "FILE_PROMPT_GUARD_SUSPICIOUS" in row.guard["rules"]
+
+
+def test_chat_without_files_still_uses_screen_path(
+    session_factory, monkeypatch, flag_log
+):
+    monkeypatch.setattr(chat_module, "screen", _clean_guard)
+
+    def _no_screen_request(*args, **kwargs):
+        raise AssertionError("screen_request must not run without files")
+
+    monkeypatch.setattr(chat_module, "screen_request", _no_screen_request)
+    fake = FakeGemini([_router_json(False), _answer("Hi!")])
+    _use_fake_llm(monkeypatch, fake)
+    with session_factory() as session:
+        result = chat(session, _user(session, "user1"), "hello")
+        assert result.status == "ANSWER"
+        assert result.files is None

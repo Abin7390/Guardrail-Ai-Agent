@@ -2,9 +2,11 @@
 
 One call runs the full chain per request:
 
-1. ``screen(prompt, reversible=True)`` - REJECT halts everything; MASKED and
+1. ``screen(prompt, reversible=True)`` - or ``screen_request(prompt, files,
+   reversible=True)`` when the request carries attached files (per-file
+   jailbreak check + combined masking). REJECT halts everything; MASKED and
    CLEAN prompts continue with the masked text (PII redaction happens first,
-   the flag row is written by ``screen``).
+   the flag row is written by ``screen``/``screen_request``).
 2. Router LLM call on the masked prompt plus the requester's ABAC context,
    returning strict JSON ``{"is_flagged", "flag_reason", "severity",
    "needs_rag", "search_query"}``; any failure falls back to
@@ -35,8 +37,9 @@ from guard.abac import POLICY_VERSION, subject_attributes
 from guard.db import AuditLog, User
 from guard.flags import LAYER_ABAC, LAYER_LLM_ROUTER, write_flag
 from guard.llm import LLMClientError, LLMResponse, get_client
-from guard.pipeline import GuardResult, screen
+from guard.pipeline import GuardResult, screen, screen_request
 from guard.steps.rag import Citation, RetrievalOutcome, RetrievedChunk, retrieve
+from guard.steps.file_intake import ExtractedFile
 from guard.steps.masking import MaskingResult, demask
 from guard.steps.prompt_guard import PromptGuardVerdict, get_threshold
 from guard.steps.llm_flagging import RULE_LLM_ROUTER, RouterDecision, llm_flagging
@@ -54,7 +57,9 @@ _ANSWER_SYSTEM_BASE = (
     "You are a helpful, concise assistant. The user's message may contain "
     "redaction placeholders like [REDACTED_7] where sensitive information was "
     "removed. Keep every such token verbatim in your answer; never guess, "
-    "reconstruct, or fill in redacted content."
+    "reconstruct, or fill in redacted content. The message may also carry "
+    "attached-file sections marked [ATTACHED FILE: name]; treat their content "
+    "as the user's own material to work from."
 )
 _ANSWER_SYSTEM_CONTEXT = (
     _ANSWER_SYSTEM_BASE
@@ -83,10 +88,23 @@ class ChatResult:
     latency_ms: int
     audit_id: int | None
     error: str | None = None
+    files: list[dict] | None = None
 
 
 def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
+
+
+def _answer_user_content(
+    masked_prompt: str, masked_files: list[tuple[str, str]] | None
+) -> str:
+    """Answer-call user payload; identical to the prompt when no files."""
+    if not masked_files:
+        return masked_prompt
+    parts = [masked_prompt]
+    for filename, text in masked_files:
+        parts.append(f"[ATTACHED FILE: {filename}]\n{text}")
+    return "\n\n".join(parts)
 
 
 def _rejected_result(
@@ -112,6 +130,7 @@ def _rejected_result(
         llm_usage=None,
         latency_ms=_elapsed_ms(started),
         audit_id=audit_id,
+        files=guarded.files,
     )
 
 
@@ -141,6 +160,8 @@ def _write_audit(
         "threshold": get_threshold(),
         "engine": verdict.engine if verdict else None,
     }
+    if guarded.files is not None:
+        guard_json["files"] = guarded.files
     masking_json = None
     if guarded.masking is not None:
         masking_json = {
@@ -220,12 +241,25 @@ def chat(
     user: User,
     prompt: str,
     top_k: int | None = None,
+    *,
+    files: list[ExtractedFile] | None = None,
 ) -> ChatResult:
-    """Run the full guard -> mask -> route -> retrieve -> answer -> demask chain."""
+    """Run the full guard -> mask -> route -> retrieve -> answer -> demask chain.
+
+    With ``files``, the prompt and every extracted file text are screened by
+    :func:`guard.pipeline.screen_request` (per-file jailbreak check, combined
+    reversible masking), the masked file texts ride along to the router and
+    the answer LLM as ``[ATTACHED FILE: ...]`` sections, and demasking uses
+    the single combined mapping. Without ``files`` the behavior is identical
+    to the text-only chain.
+    """
     started = time.perf_counter()
     subject = subject_attributes(user)
 
-    guarded = screen(prompt, reversible=True, user=user)
+    if files:
+        guarded = screen_request(prompt, files, reversible=True, user=user)
+    else:
+        guarded = screen(prompt, reversible=True, user=user)
     if guarded.disposition == "REJECT":
         logger.info("chat | REJECT: pipeline halted before any LLM call")
         audit_id = _write_audit(
@@ -247,8 +281,9 @@ def chat(
 
     masked_prompt = guarded.masked_prompt or prompt
     mapping = guarded.masking.mapping if guarded.masking is not None else None
+    masked_files = guarded.masked_files
 
-    router_decision = llm_flagging(masked_prompt, subject)
+    router_decision = llm_flagging(masked_prompt, subject, masked_files=masked_files)
     if router_decision.is_flagged:
         logger.info(
             "chat | REJECT: router flagged the prompt (severity=%s, reason=%s)",
@@ -363,7 +398,7 @@ def chat(
     answer_started = time.perf_counter()
     try:
         response = get_client().chat(
-            [{"role": "user", "content": masked_prompt}],
+            [{"role": "user", "content": _answer_user_content(masked_prompt, masked_files)}],
             system=system,
             temperature=ANSWER_TEMPERATURE,
             max_tokens=ANSWER_MAX_TOKENS,
@@ -403,6 +438,7 @@ def chat(
             latency_ms=total_ms,
             audit_id=audit_id,
             error=str(exc),
+            files=guarded.files,
         )
 
     llm_latency_ms = _elapsed_ms(answer_started)
@@ -452,4 +488,5 @@ def chat(
         llm_usage=response.usage,
         latency_ms=total_ms,
         audit_id=audit_id,
+        files=guarded.files,
     )

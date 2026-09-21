@@ -10,6 +10,7 @@ logger = logging.getLogger("guard.masking")
 
 REDACTED = "[REDACTED]"
 
+# Microsoft Presidio 
 PII_ENTITIES = [
     "PERSON",
     "ORGANIZATION",

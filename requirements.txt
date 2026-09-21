@@ -12,3 +12,5 @@ psycopg[binary]
 pyjwt
 google-genai
 python-dotenv
+pypdf
+python-multipart

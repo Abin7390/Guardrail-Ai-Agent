@@ -6,7 +6,16 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -23,6 +32,7 @@ from guard.logconf import setup_logging
 from guard.steps.rag import AskResult, ask
 from guard.steps.embedding import get_engine_mode as embedding_engine_mode
 from guard.steps.embedding import embed
+from guard.steps.file_intake import FileIntakeError, intake_files
 from guard.steps.masking import get_engine_mode as masking_engine
 from guard.steps.masking import MaskingResult
 from guard.pipeline import GuardResult, screen
@@ -131,6 +141,17 @@ class ChatRequest(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=50)
 
 
+class FileOut(BaseModel):
+    """Masked per-file metadata for chat responses; never file text."""
+
+    filename: str
+    extension: str
+    size_bytes: int
+    verdict_label: str | None
+    suspicious_score: float | None
+    entities: dict[str, int]
+
+
 class ChatResponse(BaseModel):
     status: str
     disposition: str
@@ -141,6 +162,7 @@ class ChatResponse(BaseModel):
     masking: MaskingOut | None
     used_rag: bool
     audit_id: int | None
+    files: list[FileOut] | None = None
 
 
 class AuditOut(BaseModel):
@@ -231,36 +253,36 @@ def list_users(
     return [UserOut.model_validate(user) for user in users]
 
 
-@public_router.post("/screen", response_model=ScreenResponse)
-def screen_prompt(
-    request: ScreenRequest,
-    current_user: User = Depends(get_current_user),
-) -> ScreenResponse:
-    result = screen(request.prompt, user=current_user)
-    message = {
-        "REJECT": REJECT_MESSAGE,
-        "MASKED": MASKED_MESSAGE,
-        "CLEAN": CLEAN_MESSAGE,
-    }[result.disposition]
-    return ScreenResponse(
-        disposition=result.disposition,
-        flagged=result.flagged,
-        rules=result.rules,
-        message=message,
-        masked_prompt=result.masked_prompt,
-        verdict=_verdict_out(result.verdict),
-        masking=_masking_out(result.masking),
-    )
+# @public_router.post("/screen", response_model=ScreenResponse)
+# def screen_prompt(
+#     request: ScreenRequest,
+#     current_user: User = Depends(get_current_user),
+# ) -> ScreenResponse:
+#     result = screen(request.prompt, user=current_user)
+#     message = {
+#         "REJECT": REJECT_MESSAGE,
+#         "MASKED": MASKED_MESSAGE,
+#         "CLEAN": CLEAN_MESSAGE,
+#     }[result.disposition]
+#     return ScreenResponse(
+#         disposition=result.disposition,
+#         flagged=result.flagged,
+#         rules=result.rules,
+#         message=message,
+#         masked_prompt=result.masked_prompt,
+#         verdict=_verdict_out(result.verdict),
+#         masking=_masking_out(result.masking),
+#     )
 
 
-@public_router.post("/ask", response_model=AskResponse)
-def ask_question(
-    request: AskRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-) -> AskResponse:
-    result = ask(session, current_user, request.question, request.top_k)
-    return _ask_response(result)
+# @public_router.post("/ask", response_model=AskResponse)
+# def ask_question(
+#     request: AskRequest,
+#     current_user: User = Depends(get_current_user),
+#     session: Session = Depends(get_session),
+# ) -> AskResponse:
+#     result = ask(session, current_user, request.question, request.top_k)
+#     return _ask_response(result)
 
 
 @public_router.post("/chat", response_model=ChatResponse)
@@ -270,6 +292,40 @@ def chat_prompt(
     session: Session = Depends(get_session),
 ) -> ChatResponse:
     result = chat(session, current_user, request.prompt, request.top_k)
+    if result.status == STATUS_LLM_ERROR:
+        raise HTTPException(
+            status_code=502,
+            detail=result.error or "LLM answer call failed",
+        )
+    return _chat_response(result)
+
+
+@public_router.post("/chat/upload", response_model=ChatResponse)
+async def chat_upload(
+    prompt: str = Form(..., min_length=1, max_length=20000),
+    top_k: int | None = Form(None),
+    file: UploadFile | None = File(None),
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ChatResponse:
+    """Chat with one attached file: intake -> screen its text -> answer.
+
+    Multipart form: ``prompt`` (required), optional ``top_k``, and a single
+    optional ``file`` (``.txt .md .csv .json .pdf``). Any intake failure
+    (unsupported type, over the size cap, corrupt or empty file) rejects the
+    whole request with 422; nothing is screened.
+    """
+    uploads: list[tuple[str, bytes]] = []
+    if file is not None:
+        uploads.append((file.filename or "file", await file.read()))
+    try:
+        extracted = intake_files(uploads)
+    except FileIntakeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "file intake rejected", "files": exc.errors},
+        )
+    result = chat(session, current_user, prompt, top_k, files=extracted)
     if result.status == STATUS_LLM_ERROR:
         raise HTTPException(
             status_code=502,
@@ -290,29 +346,29 @@ def list_audit(
     return [AuditOut.model_validate(row) for row in rows]
 
 
-@public_router.get("/documents", response_model=list[DocumentOut])
-def list_documents(
-    session: Session = Depends(get_session),
-    _admin: User = Depends(require_admin),
-) -> list[DocumentOut]:
-    rows = session.execute(
-        select(Document, func.count(Chunk.id))
-        .outerjoin(Chunk, Chunk.document_id == Document.id)
-        .group_by(Document.id)
-        .order_by(Document.id)
-    ).all()
-    return [
-        DocumentOut(
-            id=document.id,
-            title=document.title,
-            source_path=document.source_path,
-            doc_type=document.doc_type,
-            attributes=document.attributes or {},
-            chunk_count=count,
-            created_at=document.created_at,
-        )
-        for document, count in rows
-    ]
+# @public_router.get("/documents", response_model=list[DocumentOut])
+# def list_documents(
+#     session: Session = Depends(get_session),
+#     _admin: User = Depends(require_admin),
+# ) -> list[DocumentOut]:
+#     rows = session.execute(
+#         select(Document, func.count(Chunk.id))
+#         .outerjoin(Chunk, Chunk.document_id == Document.id)
+#         .group_by(Document.id)
+#         .order_by(Document.id)
+#     ).all()
+#     return [
+#         DocumentOut(
+#             id=document.id,
+#             title=document.title,
+#             source_path=document.source_path,
+#             doc_type=document.doc_type,
+#             attributes=document.attributes or {},
+#             chunk_count=count,
+#             created_at=document.created_at,
+#         )
+#         for document, count in rows
+#     ]
 
 
 def _ask_response(result: AskResult) -> AskResponse:
@@ -375,6 +431,18 @@ def _chat_response(result: ChatResult) -> ChatResponse:
         masking=_masking_out(result.masking),
         used_rag=bool(result.router and result.router.needs_rag),
         audit_id=result.audit_id,
+        files=[
+            FileOut(
+                filename=entry["filename"],
+                extension=entry["extension"],
+                size_bytes=entry["size_bytes"],
+                verdict_label=entry["label"],
+                suspicious_score=entry["suspicious_score"],
+                entities=entry["entities"],
+            )
+            for entry in result.files or []
+        ]
+        or None,
     )
 
 
@@ -401,9 +469,11 @@ def create_app() -> FastAPI:
         title="Custom Guardrail Service",
         description=(
             "Prompt-Guard jailbreak check + Presidio PII masking + ABAC-filtered "
-            "RAG retrieval + unified chat (mask -> route -> retrieve -> LLM -> demask)"
+            "RAG retrieval + unified chat (mask -> route -> retrieve -> LLM -> "
+            "demask), with file uploads screened through the same steps via "
+            "/v1/chat/upload"
         ),
-        version="1.1.0",
+        version="1.2.0",
         lifespan=lifespan,
     )
     app.include_router(public_router)

@@ -12,7 +12,7 @@ Standalone Python module that screens user prompts in two stages and reports fla
    | `data/patients.json` | patient details + medicines they use | `doc_type=patient_record`, `sensitivity=restricted` | `role=admin` only |
 
    Retrieval is retrieval-only (no LLM call): the response returns permitted chunks, an assembled context with `[1]`, `[2]` citation markers, and a citations list. Generation can be layered on downstream without schema changes.
-4. **Stage 4 - Unified chat** (`POST /v1/chat`): the full chain in one call - prompt guard, **reversible** PII masking (indexed `[REDACTED_1]`, `[REDACTED_2]`, ... placeholders), an LLM router call that decides whether RAG is needed, ABAC-filtered retrieval, a second LLM call that answers from the masked prompt plus context, and finally demasking of the answer. Every request writes one row to the new `audit_log` Postgres table (masked content only). See "Unified chat endpoint".
+4. **Stage 4 - Unified chat** (`POST /v1/chat`, `POST /v1/chat/upload`): the full chain in one call - prompt guard, **reversible** PII masking (indexed `[REDACTED_1]`, `[REDACTED_2]`, ... placeholders), an LLM router call that decides whether RAG is needed, ABAC-filtered retrieval, a second LLM call that answers from the masked prompt plus context, and finally demasking of the answer. Every request writes one row to the new `audit_log` Postgres table (masked content only). See "Unified chat endpoint". The multipart `/v1/chat/upload` variant additionally accepts attached files (`.txt .md .csv .json .pdf`); every guard step screens the extracted file text too (see "File uploads").
 
 Flagged events are also appended to `flags.jsonl` with the unified schema (layer, user, full masked prompt, severity, reason - never the raw prompt; see "Flag log").
 
@@ -36,6 +36,7 @@ custom/
     __main__.py       # python -m guard entry point
     steps/            # pipeline steps, numbered by run order
       __init__.py     # loads numbered files, registers import aliases
+      00_file_intake.py  # Stage 0: upload validation, caps, text extraction (.txt/.md/.csv/.json/.pdf)
       01_prompt_guard.py  # Stage 1: Prompt-Guard classifier (regex fallback offline)
       02_masking.py       # Stage 2: Presidio [REDACTED] masking (regex fallback offline)
       03_embedding.py     # Stage 3: MiniLM embeddings (hashed-trigram fallback offline)
@@ -52,6 +53,7 @@ custom/
     test_ingest.py    # ingestion tests
     test_rag.py       # ask() orchestrator tests
     test_chat.py      # unified chat orchestrator + endpoint tests
+    test_file_intake.py  # upload validation/extraction tests
   requirements.txt
   flags.jsonl         # created at runtime
 ```
@@ -151,13 +153,15 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 |--------|----------------|----------------------|-----------------------------------------------|----------------------------------------------------|
 | GET    | `/v1/health`   | -                    | -                                             | Service status + loaded engine modes.              |
 | POST   | `/v1/token`    | -                    | `{"username": "admin" \| "user1" \| "user2"}` | Issue a JWT for the chosen mock user (dropdown in `/docs`). |
-| POST   | `/v1/screen`   | Bearer token         | `{"prompt": "..."}`                           | Screen one prompt; full result as JSON.            |
-| POST   | `/v1/ask`      | Bearer token         | `{"question": "...", "top_k"?: n}`            | RAG retrieval over ABAC-permitted chunks; returns chunks + assembled context + citations. |
 | POST   | `/v1/chat`     | Bearer token         | `{"prompt": "...", "top_k"?: n}`              | Unified chain: guard -> reversible mask -> LLM router -> ABAC retrieval -> LLM answer -> demask; one `audit_log` row per request. |
+| POST   | `/v1/chat/upload` | Bearer token      | multipart form: `prompt`, `top_k`?, one optional `file` | Same chain with one attached file: every guard step also screens the extracted file text. |
 | GET    | `/v1/audit`    | Bearer token (admin) | `?limit=n` (default 20, max 100)              | Latest chat audit rows (masked content only). |
 | GET    | `/v1/users/me` | Bearer token         | -                                             | Details of the authenticated user. |
 | GET    | `/v1/users`    | Bearer token (admin) | -                                             | List all users (admin only).                       |
-| GET    | `/v1/documents`| Bearer token (admin) | -                                             | List indexed documents with attributes + chunk counts (admin only). |
+
+`/v1/screen`, `/v1/ask`, and `/v1/documents` are currently disabled in the
+router (`guard/api.py`); the underlying `screen()` / `ask()` functions and
+their offline tests remain available for the pipeline modules.
 
 ### Auth (JWT bearer)
 
@@ -166,9 +170,9 @@ Mock users live in Postgres and are seeded at startup; there are no passwords:
 
 | Username | Role  | Access                                                    |
 |----------|-------|-----------------------------------------------------------|
-| `admin`  | admin | everything, including patient records, `GET /v1/users`, `GET /v1/documents`, `GET /v1/audit` |
-| `user1`  | user  | `/v1/screen`, `/v1/ask`, `/v1/chat` (public chunks only), `/v1/users/me` |
-| `user2`  | user  | `/v1/screen`, `/v1/ask`, `/v1/chat` (public chunks only), `/v1/users/me` |
+| `admin`  | admin | everything, including patient records (via chat), `GET /v1/users`, `GET /v1/audit` |
+| `user1`  | user  | `/v1/chat`, `/v1/chat/upload` (public chunks only), `/v1/users/me` |
+| `user2`  | user  | `/v1/chat`, `/v1/chat/upload` (public chunks only), `/v1/users/me` |
 
 Get a token (the request body is a username dropdown in `/docs`):
 
@@ -364,6 +368,48 @@ Behavior details:
 - Known POC limitation: a prompt that already contains a literal
   `[REDACTED_1]` token could collide with a generated placeholder.
 
+### File uploads (`POST /v1/chat/upload`)
+
+Multipart variant of the chat endpoint: `prompt` (form field) plus a single
+optional `file` (`.txt .md .csv .json .pdf`, 5 MB, 50k extracted characters).
+The extracted file text runs through the same guard steps as the prompt:
+
+```
+stage 0 file intake: allowlist + caps + text extraction (pypdf for PDFs)
+   |-> unsupported type / oversize / corrupt / empty: 422, nothing screened
+   |
+Prompt-Guard classify: prompt AND each file text SEPARATELY
+   |-> any flagged: REJECT + flag row naming the file (details.filename)
+   |
+Presidio reversible masking on prompt + files as ONE combined document
+   (placeholders stay unique across prompt and files; result split back apart)
+   |
+LLM router: masked prompt + per-file [ATTACHED FILE: name] excerpts (4k chars)
+   |-> flagged: LLM_REJECT (instructions hidden in attachments are injection)
+   |
+LLM answer call: masked prompt + FULL masked file sections (+ RAG context)
+   |
+demask with the single combined mapping -> answer (file PII restored to the
+same requesting user, like prompt PII)
+```
+
+```powershell
+$token = (Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/token" -Method Post `
+  -ContentType "application/json" -Body '{"username": "user1"}').access_token
+
+curl.exe -X POST "http://127.0.0.1:8000/v1/chat/upload" `
+  -H "Authorization: Bearer $token" `
+  -F "prompt=Summarize the attached notes and draft a reply." `
+  -F "file=@notes.txt"
+```
+
+The response carries the usual chat fields plus a `files` list (filename,
+extension, size, per-file verdict label/score, per-file masked-entity
+counts). Files are request context only - they are never ingested into the
+RAG knowledge base, and raw file bytes/text are never persisted: the audit
+row keeps the masked prompt in `masked_prompt` and file metadata under
+`guard.files`.
+
 ### Audit log (`audit_log` table)
 
 Every chat request writes one row, auto-created by startup `create_all` (no
@@ -374,7 +420,7 @@ only; **never** the raw prompt, the demasked answer, or mapping values:
 |-----------------|--------------------------------------------------------------------------------------------------|
 | `ts`, `username`, `role`, `status` | who/when/outcome (`ANSWER`, `REJECTED`, `LLM_ERROR`).            |
 | `masked_prompt` | the prompt after reversible masking (`null` for REJECT - the raw prompt is never stored).        |
-| `guard`         | `{disposition, rules, label, suspicious_score, threshold, engine}`.                              |
+| `guard`         | `{disposition, rules, label, suspicious_score, threshold, engine}`; with uploads also `files: [{filename, extension, size_bytes, label, suspicious_score, engine, entities}]` (metadata only, never file text). |
 | `masking`       | `{engine, entities: {type: count}, placeholder_count}`.                                          |
 | `router`        | `{needs_rag, search_query, fallback_reason?}`.                                                   |
 | `rag`           | `{policy_version, permitted_chunks, chunk_ids: [{id, document_id, title, score}], dropped_chunk_ids, embedding_engine, engine_mismatch}`. |
